@@ -43,6 +43,9 @@ func main() {
 		neighbours = &tmp
 	}
 	lock := new(sync.RWMutex)
+	// We're going to store 2 forms of our data, a log of the appended items, and a uniqueness lookup to ensure we
+	// aren't storing duplicates. This allows us to return stable sub-sets of the data.
+	dataLog := make([]int64, 0, 128)
 	data := make(map[int64]bool)
 
 	n.Handle(internal.InitReqType, func(msg maelstrom.Message) error {
@@ -85,11 +88,8 @@ func main() {
 	n.Handle(readReqType, func(msg maelstrom.Message) error {
 		lock.RLock()
 		defer lock.RUnlock()
-
-		tmp := make([]int64, 0, len(data))
-		for v := range data {
-			tmp = append(tmp, v)
-		}
+		tmp := make([]int64, len(dataLog))
+		copy(tmp, dataLog)
 		return n.Reply(msg, readResp{internal.SimpleResp{Type: readRespType}, tmp})
 	})
 
@@ -102,6 +102,7 @@ func main() {
 		lock.Lock()
 		defer lock.Unlock()
 		if _, ok := data[body.Message]; !ok {
+			dataLog = append(dataLog, body.Message)
 			data[body.Message] = true
 		}
 
