@@ -1,4 +1,4 @@
-module broadcast
+module flyio-exercises
 
 go 1.20
 

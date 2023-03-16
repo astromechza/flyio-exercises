@@ -2,17 +2,16 @@ package main
 
 import (
 	"encoding/json"
-	"log"
-
+	"flyio-exercises/internal"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"log"
 )
 
 func main() {
 	n := maelstrom.NewNode()
 
-	n.Handle("init", func(msg maelstrom.Message) error {
-		log.Printf("init received %s\n", msg)
-		return nil
+	n.Handle(internal.InitReqType, func(msg maelstrom.Message) error {
+		return n.Reply(msg, internal.SimpleResp{Type: internal.InitRespType})
 	})
 
 	n.Handle("echo", func(msg maelstrom.Message) error {

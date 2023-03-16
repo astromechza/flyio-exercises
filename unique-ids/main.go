@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flyio-exercises/internal"
 	"fmt"
 	"log"
 	"sort"
@@ -10,24 +11,13 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-// initReq is the init message we get telling us how many nodes are taking part in the cluster.
-// We use this to find the 'index' of our node and us this as a unique seed.
-//
-// {"type":"init","node_id":"n0","node_ids":["n0","n1","n2"],"msg_id":1}}
-type initReq struct {
-	Id      string   `json:"node_id"`
-	NodeIds []string `json:"node_ids"`
-	MsgId   int64    `json:"msg_id"`
-}
-
 // genResp is the response model we send back for each generate request.
 type genResp struct {
-	Type string `json:"type"`
-	Id   int64  `json:"id"`
+	internal.SimpleResp
+	Id int64 `json:"id"`
 }
 
 const (
-	initReqType = "init"
 	genReqType  = "generate"
 	genRespType = "generate_ok"
 )
@@ -41,8 +31,8 @@ func main() {
 	// node id's when we replace them.
 	var counter = new(atomic.Int64)
 	var nodeCount int64
-	n.Handle(initReqType, func(msg maelstrom.Message) error {
-		var body *initReq
+	n.Handle(internal.InitReqType, func(msg maelstrom.Message) error {
+		var body *internal.InitReq
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
@@ -60,7 +50,7 @@ func main() {
 		if counter.Load() == 0 {
 			return fmt.Errorf("node id '%v' not found in topology %v", body.Id, body.NodeIds)
 		}
-		return nil
+		return n.Reply(msg, internal.SimpleResp{Type: internal.InitRespType})
 	})
 
 	// on generate, we atomically advance our counter
@@ -69,7 +59,7 @@ func main() {
 			return fmt.Errorf("node has not been initialized")
 		}
 		newId := counter.Add(nodeCount)
-		return n.Reply(msg, &genResp{genRespType, newId})
+		return n.Reply(msg, &genResp{internal.SimpleResp{Type: genRespType}, newId})
 	})
 
 	if err := n.Run(); err != nil {
