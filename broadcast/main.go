@@ -3,8 +3,9 @@ package main
 import (
 	"encoding/json"
 	"flyio-exercises/internal"
-	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -59,47 +60,11 @@ func main() {
 	dataLog := make([]int64, 0, 128)
 	data := make(map[int64]bool)
 
-	n.Handle(internal.InitReqType, func(msg maelstrom.Message) error {
-		var body *internal.InitReq
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-		log.Printf("Received init: %v\n", body)
-		if len(body.NodeIds) == 0 {
-			return fmt.Errorf("initialized with empty topology")
-		}
-
-		for _, id := range body.NodeIds {
-			neighbours.LoadOrStore(id, 0)
-		}
-		log.Printf("Updated neighbouring nodes to %v", neighbours)
-		return n.Reply(msg, internal.SimpleResp{Type: internal.InitRespType})
-	})
-
 	n.Handle(topologyReqType, func(msg maelstrom.Message) error {
-		var body *topologyReq
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
+		if err := n.Reply(msg, internal.SimpleResp{Type: topologyRespType}); err != nil {
+			log.Printf("ignoring failed topology ok reply")
 		}
-		log.Printf("Received topology update: %v\n", body)
-
-		if raw, ok := body.Topology[n.ID()]; ok {
-			tmp := make(map[string]bool)
-			// insert any new peers
-			for _, id := range raw {
-				tmp[id] = true
-				neighbours.LoadOrStore(id, 0)
-			}
-			// delete any old peers
-			neighbours.Range(func(key, value any) bool {
-				if _, ok := tmp[key.(string)]; !ok {
-					neighbours.Delete(key)
-				}
-				return true
-			})
-			log.Printf("Updated neighbouring nodes to %v", neighbours)
-		}
-		return n.Reply(msg, internal.SimpleResp{Type: topologyRespType})
+		return nil
 	})
 
 	n.Handle(readReqType, func(msg maelstrom.Message) error {
@@ -145,9 +110,9 @@ func main() {
 			}
 		}
 
-		return n.Reply(msg, syncResp{
+		return n.Send(msg.Src, syncResp{
 			internal.SimpleResp{Type: syncRespType},
-			body.Position,
+			body.Position + len(body.Messages),
 		})
 	})
 
@@ -171,18 +136,30 @@ func main() {
 		return nil
 	})
 
+	pulseFraction := 0.2
 	pulse := func() {
-		log.Printf("pulse-start")
-		defer log.Printf("pulse-end")
-		lock.RLock()
-		defer lock.RUnlock()
 		dl := len(dataLog)
 
-		neighbours.Range(func(key, value any) bool {
-			id := key.(string)
-			oldPos := value.(int)
-			if oldPos < dl {
+		ids := make([]string, len(n.NodeIDs()))
+		copy(ids, n.NodeIDs())
+		rand.Shuffle(len(ids), func(i, j int) {
+			t := ids[i]
+			ids[i] = ids[j]
+			ids[j] = t
+		})
+		ids = ids[0:int(math.Ceil(pulseFraction*float64(len(ids))))]
+		lock.RLock()
+		defer lock.RUnlock()
 
+		for _, id := range ids {
+			if id == n.ID() {
+				continue
+			}
+			oldPos := 0
+			if raw, ok := neighbours.Load(id); ok {
+				oldPos = raw.(int)
+			}
+			if oldPos < dl {
 				missingMessageCount := dl - oldPos
 				missingMessages := make([]int64, missingMessageCount)
 				for i := 0; i < missingMessageCount; i++ {
@@ -198,11 +175,15 @@ func main() {
 					log.Printf("temporary error sending reply: %v", err)
 				}
 			}
+		}
+
+		neighbours.Range(func(key, value any) bool {
+
 			return true
 		})
 	}
 
-	ticker := time.NewTicker(time.Millisecond * 500)
+	ticker := time.NewTicker(time.Millisecond * 100)
 	defer ticker.Stop()
 	done := make(chan bool)
 	go func() {
