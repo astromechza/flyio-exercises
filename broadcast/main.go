@@ -29,11 +29,6 @@ type broadcastReq struct {
 	Message int64 `json:"message"`
 }
 
-type topologyReq struct {
-	internal.SimpleReq
-	Topology map[string][]string `json:"topology"`
-}
-
 type readResp struct {
 	internal.SimpleResp
 	Messages []int64 `json:"messages"`
@@ -136,7 +131,7 @@ func main() {
 		return nil
 	})
 
-	pulseFraction := 0.2
+	pulseFraction := 0.1
 	pulse := func() {
 		dl := len(dataLog)
 
