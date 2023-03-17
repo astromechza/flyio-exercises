@@ -96,8 +96,10 @@ type pendingMessage struct {
 }
 
 type keyCoordinator struct {
-	Mutex   *sync.Mutex
-	Pending chan pendingMessage
+	Mutex              *sync.Mutex
+	Pending            chan pendingMessage
+	Segment            int
+	RemainingInSegment int
 }
 
 func main() {
@@ -157,8 +159,9 @@ func main() {
 		callback := make(chan int, 1)
 		pending := pendingMessage{Message: body.Message, Callback: callback}
 		rawCoordinator, _ := coordinators.LoadOrStore(body.Key, &keyCoordinator{
-			Mutex:   new(sync.Mutex),
-			Pending: make(chan pendingMessage, maxMessagesPerSegment),
+			Mutex:              new(sync.Mutex),
+			Pending:            make(chan pendingMessage, maxMessagesPerSegment),
+			RemainingInSegment: maxMessagesPerSegment,
 		})
 		coordinator := rawCoordinator.(*keyCoordinator)
 		coordinator.Pending <- pending
@@ -166,31 +169,31 @@ func main() {
 		coordinator.Mutex.Lock()
 		defer coordinator.Mutex.Unlock()
 
-		segment, err := getOrCreateLatestSegment(kv, body.Key, 5)
-		if err != nil {
-			return err
-		}
-
-		data, exists, err := readSegment(kv, body.Key, segment)
-		if err != nil {
-			return err
-		} else if !exists {
-			data = make([]int, 0)
-		}
-
-		availableInSegment := maxMessagesPerSegment - len(data)
-
-		if availableInSegment <= 0 {
-			segment, err = advanceSegment(kv, body.Key, segment+1)
-			data = make([]int, 0)
+		segment := coordinator.Segment
+		if coordinator.RemainingInSegment == 0 {
+			newSegment, err := advanceSegment(kv, body.Key, segment+1)
+			if err != nil {
+				return err
+			}
+			if newSegment != segment {
+				segment = newSegment
+				coordinator.RemainingInSegment = maxMessagesPerSegment
+			}
 		}
 
 		items := make([]pendingMessage, 0)
-		for len(coordinator.Pending) > 0 && len(items) < availableInSegment {
+		for len(coordinator.Pending) > 0 && len(items) < coordinator.RemainingInSegment {
 			items = append(items, <-coordinator.Pending)
 		}
 
 		if len(items) > 0 {
+
+			data, exists, err := readSegment(kv, body.Key, segment)
+			if err != nil {
+				return err
+			} else if !exists {
+				data = make([]int, 0)
+			}
 
 			newData := data
 			for _, item := range items {
@@ -207,6 +210,8 @@ func main() {
 			for i, item := range items {
 				item.Callback <- segment*maxMessagesPerSegment + len(data) + i
 			}
+
+			coordinator.RemainingInSegment -= len(items)
 		}
 
 		offset := <-callback
