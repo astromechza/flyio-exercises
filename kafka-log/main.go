@@ -21,7 +21,9 @@ import (
 	"flyio-exercises/internal"
 	"fmt"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"hash/fnv"
 	"log"
+	"sort"
 )
 
 const (
@@ -37,11 +39,12 @@ const (
 	listCommittedOffsetsType   = "list_committed_offsets"
 	listCommittedOffsetsOkType = listCommittedOffsetsType + "_ok"
 
-	dataPrefix         = "data_"
-	nextOffsetPrefix   = "next_offset_"
+	activeSegmentPrefix = "active_segment_"
+	segmentPrefix       = "segment_"
+
 	committedOffsetKey = "committed_offset_"
 
-	initialOffsetValue = 1
+	maxMessagesPerSegment = 100
 )
 
 type sendBody struct {
@@ -80,50 +83,62 @@ type listCommittedOffsetsOkBody struct {
 	Offsets map[string]int `json:"offsets"`
 }
 
+func nodeFor(nodeIds []string, key string) string {
+	h := fnv.New64()
+	_, _ = h.Write([]byte(key))
+	return nodeIds[h.Sum64()%uint64(len(nodeIds))]
+}
+
 func main() {
 
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
 
+	nodeIds := make([]string, 0)
+
+	n.Handle(internal.InitReqType, func(msg maelstrom.Message) error {
+		var body *internal.InitReq
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		nodeIds = body.NodeIds
+		sort.Strings(nodeIds)
+		return nil
+	})
+
 	n.Handle(sendType, func(msg maelstrom.Message) error {
-		// 1. read body
-		// 2. read nextOffset key
-		// 3. write payload
-		// 4. update nextOffset key
+		// - read body
+		// - identify latest segment
+		// - load latest segment
+		// - if segment will overflow threshold, overwrite segment file and goto -1
+		// - add item to end of segment with latest offset and CAS
 		var body *sendBody
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		nextOffsetKey := nextOffsetPrefix + body.Key
-		nextOffset := initialOffsetValue
-		raw, err := kv.Read(context.Background(), nextOffsetKey)
+		segment, err := getOrCreateLatestSegment(kv, body.Key, 5)
 		if err != nil {
-			var rpcError *maelstrom.RPCError
-			if !errors.As(err, &rpcError) || rpcError.Code != maelstrom.KeyDoesNotExist {
-				return err
-			}
-		} else {
-			nextOffset = raw.(int)
+			return err
 		}
 
-		for ; ; nextOffset++ {
-			if err := kv.CompareAndSwap(context.Background(), nextOffsetKey, nextOffset, nextOffset+1, true); err != nil {
-				var rpcError *maelstrom.RPCError
-				if !errors.As(err, &rpcError) || rpcError.Code != maelstrom.PreconditionFailed {
-					return err
-				}
-				continue
-			}
-			break
+		data, exists, err := readSegment(kv, body.Key, segment)
+		if err != nil {
+			return err
+		} else if !exists {
+			data = make([]int, 0)
 		}
 
-		// there's a possible problem here of 'orphaned' offsets which never get data written if the process crashes or halts here.
-		// in the real world we may want to put these offsets onto a dead letter queue in order to "fence" out side effects and get
-		// back our availability.
+		if len(data) >= maxMessagesPerSegment {
+			segment, err = advanceSegment(kv, body.Key, segment+1)
+			data = make([]int, 0)
+		}
 
-		offsetKey := dataPrefix + body.Key + fmt.Sprintf("_%010d", nextOffset)
-		if err := kv.Write(context.Background(), offsetKey, body.Message); err != nil {
+		nextOffset := segment*maxMessagesPerSegment + len(data)
+		data = append(data, body.Message)
+
+		if err = writeSegment(kv, body.Key, segment, data); err != nil {
 			return err
 		}
 
@@ -147,22 +162,22 @@ func main() {
 
 		response := make(map[string][][2]int)
 		for key, startOffset := range body.Offsets {
-			if startOffset < initialOffsetValue {
-				startOffset = initialOffsetValue
+			if startOffset < 0 {
+				startOffset = 0
 			}
-			for offset := startOffset; ; offset++ {
-				offsetKey := dataPrefix + key + fmt.Sprintf("_%010d", offset)
-				raw, err := kv.Read(context.Background(), offsetKey)
-				if err == nil {
-					if value, ok := raw.(int); ok {
-						response[key] = append(response[key], [2]int{offset, value})
-					}
-				} else {
-					var rpcError *maelstrom.RPCError
-					if errors.As(err, &rpcError) && rpcError.Code != maelstrom.KeyDoesNotExist {
-						return err
-					}
+			startSegment := startOffset / maxMessagesPerSegment
+			offset := startOffset % maxMessagesPerSegment
+			for segment := startSegment; ; segment++ {
+				data, exists, err := readSegment(kv, key, segment)
+				if err != nil {
+					return err
+				} else if !exists {
 					break
+				} else {
+					for ; offset < len(data); offset++ {
+						response[key] = append(response[key], [2]int{segment*maxMessagesPerSegment + offset, data[offset]})
+					}
+					offset = 0
 				}
 			}
 		}
@@ -220,4 +235,62 @@ func main() {
 		log.Fatal(err)
 	}
 
+}
+
+func buildActiveSegmentKey(key string) string {
+	return activeSegmentPrefix + key
+}
+
+func buildSegmentKey(key string, id int) string {
+	return segmentPrefix + key + fmt.Sprintf("_%010d", id)
+}
+
+func writeSegment(kv *maelstrom.KV, key string, segment int, data []int) error {
+	return kv.CompareAndSwap(context.Background(), buildSegmentKey(key, segment), data[:len(data)-1], data, true)
+}
+
+func advanceSegment(kv *maelstrom.KV, key string, segment int) (int, error) {
+	if err := kv.CompareAndSwap(context.Background(), buildActiveSegmentKey(key), segment, segment+1, true); err != nil {
+		return 0, err
+	}
+	return segment + 1, nil
+}
+
+func getOrCreateLatestSegment(kv *maelstrom.KV, key string, maxRetry int) (int, error) {
+	raw, err := kv.Read(context.Background(), buildActiveSegmentKey(key))
+	if err != nil {
+		var rpcError *maelstrom.RPCError
+		if !errors.As(err, &rpcError) || rpcError.Code != maelstrom.KeyDoesNotExist {
+			return 0, err
+		}
+		if err := kv.CompareAndSwap(context.Background(), buildActiveSegmentKey(key), nil, 0, true); err != nil {
+			var rpcError *maelstrom.RPCError
+			if !errors.As(err, &rpcError) || rpcError.Code != maelstrom.PreconditionFailed || maxRetry == 0 {
+				return 0, err
+			}
+			return getOrCreateLatestSegment(kv, key, maxRetry-1)
+		}
+		return 0, nil
+	} else {
+		return raw.(int), nil
+	}
+}
+
+func readSegment(kv *maelstrom.KV, key string, segment int) ([]int, bool, error) {
+	segmentKey := buildSegmentKey(key, segment)
+	raw, err := kv.Read(context.Background(), segmentKey)
+	if err != nil {
+		var rpcError *maelstrom.RPCError
+		if !errors.As(err, &rpcError) || rpcError.Code != maelstrom.KeyDoesNotExist {
+			return nil, false, err
+		}
+		return nil, false, nil
+	} else {
+		rawSlice := raw.([]any)
+		data := make([]int, len(rawSlice))
+		for i := 0; i < len(rawSlice); i++ {
+			data[i] = int(rawSlice[i].(float64))
+		}
+		return data, true, nil
+	}
 }
