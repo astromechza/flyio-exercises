@@ -106,6 +106,7 @@ func main() {
 	kv := maelstrom.NewLinKV(n)
 
 	nodeIds := make([]string, 0)
+	coordinators := new(sync.Map)
 
 	n.Handle(internal.InitReqType, func(msg maelstrom.Message) error {
 		var body *internal.InitReq
@@ -153,22 +154,17 @@ func main() {
 			})
 		}
 
-		//callback := make(chan int)
-		//pending := pendingMessage{Message: body.Message, Callback: callback}
-		//rawCoordinator, _ := coordinated.LoadOrStore(body.Key, &keyCoordinator{
-		//	Mutex:   new(sync.Mutex),
-		//	Pending: make(chan pendingMessage, 100),
-		//})
-		//coordinator := rawCoordinator.(*keyCoordinator)
-		//coordinator.Pending <- pending
-		//
-		//coordinator.Mutex.Lock()
-		//defer coordinator.Mutex.Unlock()
-		//
-		//items := make([]pendingMessage, 0)
-		//for len(coordinator.Pending) > 0  {
-		//	items = append(items, <- coordinator.Pending)
-		//}
+		callback := make(chan int, 1)
+		pending := pendingMessage{Message: body.Message, Callback: callback}
+		rawCoordinator, _ := coordinators.LoadOrStore(body.Key, &keyCoordinator{
+			Mutex:   new(sync.Mutex),
+			Pending: make(chan pendingMessage, maxMessagesPerSegment),
+		})
+		coordinator := rawCoordinator.(*keyCoordinator)
+		coordinator.Pending <- pending
+
+		coordinator.Mutex.Lock()
+		defer coordinator.Mutex.Unlock()
 
 		segment, err := getOrCreateLatestSegment(kv, body.Key, 5)
 		if err != nil {
@@ -182,21 +178,44 @@ func main() {
 			data = make([]int, 0)
 		}
 
-		if len(data) >= maxMessagesPerSegment {
+		availableInSegment := maxMessagesPerSegment - len(data)
+
+		if availableInSegment <= 0 {
 			segment, err = advanceSegment(kv, body.Key, segment+1)
 			data = make([]int, 0)
 		}
 
-		nextOffset := segment*maxMessagesPerSegment + len(data)
-		data = append(data, body.Message)
-
-		if err = writeSegment(kv, body.Key, segment, data); err != nil {
-			return err
+		items := make([]pendingMessage, 0)
+		for len(coordinator.Pending) > 0 && len(items) < availableInSegment {
+			items = append(items, <-coordinator.Pending)
 		}
 
+		if len(items) > 0 {
+
+			newData := data
+			for _, item := range items {
+				newData = append(newData, item.Message)
+			}
+
+			if err = writeSegment(kv, body.Key, segment, data, newData); err != nil {
+				for _, item := range items {
+					item.Callback <- -1
+				}
+				return err
+			}
+
+			for i, item := range items {
+				item.Callback <- segment*maxMessagesPerSegment + len(data) + i
+			}
+		}
+
+		offset := <-callback
+		if offset == -1 {
+			return maelstrom.NewRPCError(maelstrom.PreconditionFailed, "segment write failed")
+		}
 		return n.Reply(msg, sendOkBody{
 			SimpleResp: internal.SimpleResp{Type: sendOkType},
-			Offset:     nextOffset,
+			Offset:     offset,
 		})
 	})
 
@@ -297,8 +316,8 @@ func buildSegmentKey(key string, id int) string {
 	return segmentPrefix + key + fmt.Sprintf("_%010d", id)
 }
 
-func writeSegment(kv *maelstrom.KV, key string, segment int, data []int) error {
-	return kv.CompareAndSwap(context.Background(), buildSegmentKey(key, segment), data[:len(data)-1], data, true)
+func writeSegment(kv *maelstrom.KV, key string, segment int, original []int, next []int) error {
+	return kv.CompareAndSwap(context.Background(), buildSegmentKey(key, segment), original, next, true)
 }
 
 func advanceSegment(kv *maelstrom.KV, key string, segment int) (int, error) {
