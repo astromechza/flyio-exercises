@@ -24,6 +24,7 @@ import (
 	"hash/fnv"
 	"log"
 	"sort"
+	"sync"
 )
 
 const (
@@ -89,6 +90,16 @@ func nodeFor(nodeIds []string, key string) string {
 	return nodeIds[h.Sum64()%uint64(len(nodeIds))]
 }
 
+type pendingMessage struct {
+	Message  int
+	Callback chan<- int
+}
+
+type keyCoordinator struct {
+	Mutex   *sync.Mutex
+	Pending chan pendingMessage
+}
+
 func main() {
 
 	n := maelstrom.NewNode()
@@ -117,6 +128,47 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
+
+		if target := nodeFor(nodeIds, body.Key); target != n.ID() {
+			subMsg, err := n.SyncRPC(
+				context.Background(),
+				target,
+				&sendBody{
+					SimpleReq: internal.SimpleReq{Type: sendType},
+					Key:       body.Key,
+					Message:   body.Message,
+				},
+			)
+			if err != nil {
+				return err
+			}
+			var subBody *sendOkBody
+			if err := json.Unmarshal(subMsg.Body, &subBody); err != nil {
+				return err
+			}
+
+			return n.Reply(msg, sendOkBody{
+				SimpleResp: internal.SimpleResp{Type: sendOkType},
+				Offset:     subBody.Offset,
+			})
+		}
+
+		//callback := make(chan int)
+		//pending := pendingMessage{Message: body.Message, Callback: callback}
+		//rawCoordinator, _ := coordinated.LoadOrStore(body.Key, &keyCoordinator{
+		//	Mutex:   new(sync.Mutex),
+		//	Pending: make(chan pendingMessage, 100),
+		//})
+		//coordinator := rawCoordinator.(*keyCoordinator)
+		//coordinator.Pending <- pending
+		//
+		//coordinator.Mutex.Lock()
+		//defer coordinator.Mutex.Unlock()
+		//
+		//items := make([]pendingMessage, 0)
+		//for len(coordinator.Pending) > 0  {
+		//	items = append(items, <- coordinator.Pending)
+		//}
 
 		segment, err := getOrCreateLatestSegment(kv, body.Key, 5)
 		if err != nil {
