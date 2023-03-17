@@ -41,7 +41,7 @@ const (
 	nextOffsetPrefix   = "next_offset_"
 	committedOffsetKey = "committed_offset_"
 
-	initialOffsetValue = 100000
+	initialOffsetValue = 1
 )
 
 type sendBody struct {
