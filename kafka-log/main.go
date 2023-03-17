@@ -96,10 +96,10 @@ type pendingMessage struct {
 }
 
 type keyCoordinator struct {
-	Mutex              *sync.Mutex
-	Pending            chan pendingMessage
-	Segment            int
-	RemainingInSegment int
+	Semaphore   chan int
+	Pending     chan pendingMessage
+	Segment     int
+	SegmentData []int
 }
 
 func main() {
@@ -158,63 +158,64 @@ func main() {
 
 		callback := make(chan int, 1)
 		pending := pendingMessage{Message: body.Message, Callback: callback}
-		rawCoordinator, _ := coordinators.LoadOrStore(body.Key, &keyCoordinator{
-			Mutex:              new(sync.Mutex),
-			Pending:            make(chan pendingMessage, maxMessagesPerSegment),
-			RemainingInSegment: maxMessagesPerSegment,
+		rawCoordinator, ok := coordinators.LoadOrStore(body.Key, &keyCoordinator{
+			Semaphore:   make(chan int, 1),
+			Pending:     make(chan pendingMessage, maxMessagesPerSegment),
+			SegmentData: make([]int, 0, maxMessagesPerSegment),
 		})
 		coordinator := rawCoordinator.(*keyCoordinator)
+		if !ok {
+			coordinator.Semaphore <- 1
+		}
 		coordinator.Pending <- pending
 
-		coordinator.Mutex.Lock()
-		defer coordinator.Mutex.Unlock()
-
-		segment := coordinator.Segment
-		if coordinator.RemainingInSegment == 0 {
-			newSegment, err := advanceSegment(kv, body.Key, segment+1)
-			if err != nil {
-				return err
-			}
-			if newSegment != segment {
-				segment = newSegment
-				coordinator.RemainingInSegment = maxMessagesPerSegment
-			}
-		}
-
-		items := make([]pendingMessage, 0)
-		for len(coordinator.Pending) > 0 && len(items) < coordinator.RemainingInSegment {
-			items = append(items, <-coordinator.Pending)
-		}
-
-		if len(items) > 0 {
-
-			data, exists, err := readSegment(kv, body.Key, segment)
-			if err != nil {
-				return err
-			} else if !exists {
-				data = make([]int, 0)
-			}
-
-			newData := data
-			for _, item := range items {
-				newData = append(newData, item.Message)
-			}
-
-			if err = writeSegment(kv, body.Key, segment, data, newData); err != nil {
-				for _, item := range items {
-					item.Callback <- -1
+		offset := -1
+		select {
+		case <-coordinator.Semaphore:
+			defer func() {
+				coordinator.Semaphore <- 1
+			}()
+			if len(coordinator.SegmentData) >= maxMessagesPerSegment {
+				newSegment, err := advanceSegment(kv, body.Key, coordinator.Segment+1)
+				if err != nil {
+					return err
 				}
-				return err
+				if newSegment != coordinator.Segment {
+					coordinator.Segment = newSegment
+					coordinator.SegmentData = make([]int, 0, maxMessagesPerSegment)
+				}
 			}
 
-			for i, item := range items {
-				item.Callback <- segment*maxMessagesPerSegment + len(data) + i
+			items := make([]pendingMessage, 0)
+			for len(coordinator.Pending) > 0 && (len(items)+len(coordinator.SegmentData)) < maxMessagesPerSegment {
+				items = append(items, <-coordinator.Pending)
 			}
 
-			coordinator.RemainingInSegment -= len(items)
+			if len(items) > 0 {
+
+				newData := coordinator.SegmentData
+				for _, item := range items {
+					newData = append(newData, item.Message)
+				}
+
+				if err := writeSegment(kv, body.Key, coordinator.Segment, coordinator.SegmentData, newData); err != nil {
+					for _, item := range items {
+						item.Callback <- -1
+					}
+					return err
+				}
+
+				for i, item := range items {
+					item.Callback <- coordinator.Segment*maxMessagesPerSegment + len(coordinator.SegmentData) + i
+				}
+
+				coordinator.SegmentData = newData
+			}
+			offset = <-callback
+		case o := <-callback:
+			offset = o
 		}
 
-		offset := <-callback
 		if offset == -1 {
 			return maelstrom.NewRPCError(maelstrom.PreconditionFailed, "segment write failed")
 		}
@@ -330,26 +331,6 @@ func advanceSegment(kv *maelstrom.KV, key string, segment int) (int, error) {
 		return 0, err
 	}
 	return segment + 1, nil
-}
-
-func getOrCreateLatestSegment(kv *maelstrom.KV, key string, maxRetry int) (int, error) {
-	raw, err := kv.Read(context.Background(), buildActiveSegmentKey(key))
-	if err != nil {
-		var rpcError *maelstrom.RPCError
-		if !errors.As(err, &rpcError) || rpcError.Code != maelstrom.KeyDoesNotExist {
-			return 0, err
-		}
-		if err := kv.CompareAndSwap(context.Background(), buildActiveSegmentKey(key), nil, 0, true); err != nil {
-			var rpcError *maelstrom.RPCError
-			if !errors.As(err, &rpcError) || rpcError.Code != maelstrom.PreconditionFailed || maxRetry == 0 {
-				return 0, err
-			}
-			return getOrCreateLatestSegment(kv, key, maxRetry-1)
-		}
-		return 0, nil
-	} else {
-		return raw.(int), nil
-	}
 }
 
 func readSegment(kv *maelstrom.KV, key string, segment int) ([]int, bool, error) {
